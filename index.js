@@ -1,5 +1,5 @@
 // index.js
-// HaggleHub API (Render) — Mailgun -> Render -> Base44 forwarder
+// HaggleHub API (Render) — Mailgun -> Render -> Base44 (no deal-id parsing)
 
 import express from "express";
 import cors from "cors";
@@ -10,99 +10,98 @@ const app = express();
 // ---- Middleware ----
 app.use(cors({ origin: process.env.CORS_ORIGIN || "*" }));
 app.use(express.json());
-// Mailgun posts as x-www-form-urlencoded (and sometimes multipart)
-// This parser covers urlencoded form bodies:
-app.use(express.urlencoded({ extended: false }));
+app.use(express.urlencoded({ extended: false })); // parse Mailgun form posts
 
-// ---- Simple in-memory test data (optional) ----
-const messages = []; // {dealId, channel, direction, body, meta, createdAt}
+// ---- Simple debug data (optional) ----
+const messages = []; // just so you can view something at /deals/1/messages
 const deals = [{ id: 1, dealerName: "Test Dealer", vehicleTitle: "Sample Car", status: "open" }];
 
-// ---- Health / sanity routes ----
-app.get("/", (req, res) => res.send("HaggleHub API is running. Try GET /deals"));
-app.get("/deals", (req, res) => res.json(deals));
+app.get("/", (_req, res) => res.send("HaggleHub API is running. Try GET /deals"));
+app.get("/deals", (_req, res) => res.json(deals));
 app.get("/deals/:id/messages", (req, res) => {
   const dealId = Number(req.params.id);
   res.json(messages.filter(m => m.dealId === dealId));
 });
 
 // ---- Mailgun Inbound Webhook ----
-// Set this URL in Mailgun -> Routes:
+// Mailgun Route action:
 // forward("https://api.hagglehub.app/webhooks/email/mailgun"); stop();
 app.post("/webhooks/email/mailgun", async (req, res) => {
-  // 1) Extract common Mailgun fields safely
-  const sender   = req.body.sender || req.body.from || req.body["From"] || "";
-  const subject  = req.body.subject || req.body["Subject"] || "";
-  const textBody = req.body["body-plain"] || req.body["stripped-text"] || "";
-  const toHeader = req.body.recipient || req.body.to || req.body["To"] || "";
+  // 1) Pull common fields from Mailgun
+  const sender    = req.body.sender || req.body.from || req.body["From"] || "";
+  const subject   = req.body.subject || req.body["Subject"] || "";
+  const textBody  = req.body["body-plain"] || req.body["stripped-text"] || "";
+  const htmlBody  = req.body["body-html"]  || req.body["stripped-html"]  || "";
+  const recipient = req.body.recipient || req.body.to || req.body["To"] || "";
+  const messageId = req.body["message-id"] || req.body["Message-Id"] || req.body["Message-ID"] || "";
 
-  // 2) Determine dealId
-  //    Preferred: subject contains [Deal#123] or Deal#123
-  //    Fallback: recipient local-part looks like deal-123@ or deals-123@
-  let dealId;
-  const m1 = subject.match(/\[Deal#(\d+)\]/i);   // [Deal#123]
-  const m2 = subject.match(/\bDeal#(\d+)\b/i);   // Deal#123
-  if (m1) dealId = Number(m1[1]);
-  else if (m2) dealId = Number(m2[1]);
-  else {
-    const toLocal = (toHeader || "").split("@")[0]; // before @
-    const m3 = toLocal.match(/deals?-(\d+)/i);       // deal-123 / deals-123
-    if (m3) dealId = Number(m3[1]);
+  // Split recipient for matching on your Base44 side (unique email per user)
+  let recipientLocal = "";
+  let recipientDomain = "";
+  if (recipient && recipient.includes("@")) {
+    const parts = recipient.split("@");
+    recipientLocal = parts[0].trim();
+    recipientDomain = parts[1].trim();
   }
-  if (!dealId) dealId = 1; // Fallback for testing
 
-  // 3) ACK Mailgun immediately (prevents retries even if our later steps fail)
+  // 2) Immediately ACK Mailgun (prevents retries)
   res.status(200).send("OK");
 
-  // 4) Log and store a local copy (optional, for debugging)
+  // 3) Log + store a local debug copy (optional; always uses dealId=1 locally)
   messages.push({
-    dealId,
+    dealId: 1, // purely for your local debug endpoint
     channel: "email",
     direction: "in",
-    body: textBody || "(no body)",
-    meta: { sender, subject, toHeader },
+    body: textBody || htmlBody || "(no body)",
+    meta: { sender, subject, recipient, messageId, recipientLocal, recipientDomain },
     createdAt: new Date().toISOString()
   });
   console.log("Inbound email:", {
     sender,
     subject,
-    dealId,
-    preview: (textBody || "").slice(0, 120)
+    recipient,
+    messageId,
+    preview: (textBody || htmlBody || "").toString().slice(0, 160)
   });
 
-  // 5) Forward into Base44 so your app UI (which reads from Base44) will see it
+  // 4) Forward to Base44 with NO deal reference
+  //    Your Base44 side should associate by recipientLocal/recipient (unique proxy),
+  //    or by sender/name heuristics you control there.
   try {
     const apiKey = process.env.BASE44_API_KEY;
     if (!apiKey) {
       console.error("Missing BASE44_API_KEY — cannot forward to Base44");
       return;
     }
-
-    // Create a normal Base44 client using your project API key (no asServiceRole)
     const base44 = createClient({ apiKey });
 
-    // Adjust fields here if your Base44 "Message" entity uses different names
+    // 🔧 Adjust keys below to match your Base44 Message entity schema.
+    // Suggested minimal fields for easy matching on Base44:
+    // - channel, direction
+    // - senderEmail, recipientEmail, recipientLocal, recipientDomain
+    // - subject, textBody, htmlBody, messageId
+    // If your entity uses different names, rename the keys in `data` accordingly.
     await base44.entities.Message.create({
       data: {
         channel: "email",
         direction: "in",
-        sender: sender,
-        subject: subject,
-        body: textBody || "",
-        dealId: dealId
+        senderEmail: sender,
+        recipientEmail: recipient,
+        recipientLocal,
+        recipientDomain,
+        subject,
+        textBody: textBody || "",
+        htmlBody: htmlBody || "",
+        externalId: messageId   // optional external reference
       }
     });
 
-    console.log("Forwarded to Base44 → Message.create OK (dealId:", dealId, ")");
+    console.log("Forwarded to Base44 → Message.create OK (no dealId used)");
   } catch (err) {
-    console.error(
-      "Base44 forward error:",
-      err && err.message ? err.message : String(err)
-    );
+    console.error("Base44 forward error:", err && err.message ? err.message : String(err));
   }
 });
 
-// ---- Start server (Render sets PORT) ----
+// ---- Start server ----
 const PORT = process.env.PORT || 3000;
-// Some platforms require binding to 0.0.0.0; Render handles this automatically.
 app.listen(PORT, () => console.log(`HaggleHub API listening on ${PORT}`));
