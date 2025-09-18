@@ -1,5 +1,4 @@
-// index.js for Render - FINAL VERSION 2
-// HaggleHub API — Mailgun -> Render -> Base44
+// index.js for Render - Fallback System Version
 
 import express from "express";
 import cors from "cors";
@@ -28,38 +27,21 @@ const extractTokenFromLocal = (localPart) => {
 
 const stripHtml = (html) => (html || "").replace(/<[^>]+>/g, "");
 const extractVIN = (text) => text?.match(/\b([A-HJ-NPR-Z0-9]{17})\b/i)?.[1].toUpperCase() || "";
-const extractDealerName = (text) => {
-    const name = text?.match(/from\s+([\w\s&.,'’\-]+?)(?:[\.\n\r]|$)/i)?.[1]?.trim();
-    if (!name || ["me", "us"].includes(name.toLowerCase())) return "";
-    return name.slice(0, 80);
-};
 
 // --- Base44 Helpers ---
-async function findUserByEmailId(base44, emailIdentifier) {
+async function findUserAndFallbackDeal(base44, emailIdentifier) {
     if (!emailIdentifier) return null;
     const { items } = await base44.entities.User.list({ where: { email_identifier: emailIdentifier }, limit: 1 });
-    return items?.[0] || null;
-}
+    const user = items?.[0];
+    if (!user || !user.fallback_deal_id) return null;
 
-async function findOrCreateDealer(base44, dealerName, sender) {
-    const safeName = dealerName?.trim() || sender.split('@')[0].replace(/[._-]/g, ' ').trim();
-    if (!safeName) { // Final check for a valid name
-        throw new Error("Could not determine a valid dealer name from sender email.");
-    }
-    const { items } = await base44.entities.Dealer.list({ where: { name: safeName }, limit: 1 });
-    if (items?.[0]?.id) {
-        console.log(`Found existing dealer: ${safeName} (ID: ${items[0].id})`);
-        return items[0].id;
-    }
+    // Fetch the associated fallback deal to get the dealer_id
+    const deals = await base44.entities.Deal.filter({id: user.fallback_deal_id});
+    const deal = deals?.[0];
+    if (!deal) return null;
     
-    console.log(`Creating new dealer: ${safeName}`);
-    // FIX: DO NOT specify created_by. The service key will own this record.
-    const newDealer = await base44.entities.Dealer.create({
-        data: { name: safeName, contact_email: sender }
-    });
-    return newDealer.id;
+    return { userId: user.id, dealId: deal.id, dealerId: deal.dealer_id };
 }
-
 
 // --- Main Webhook ---
 app.post("/webhooks/email/mailgun", async (req, res) => {
@@ -69,11 +51,11 @@ app.post("/webhooks/email/mailgun", async (req, res) => {
     try {
         // 1. Extract data
         const sender = req.body.sender || req.body.from || "";
-        const recipient = req.body.recipient || req.body.to || "";
         const subject = req.body.subject || "";
         const textBody = req.body["body-plain"] || "";
         const htmlBody = req.body["body-html"] || "";
         const content = textBody || stripHtml(htmlBody);
+        const recipient = req.body.recipient || req.body.to || "";
 
         const { local: recipientLocal } = splitRecipient(recipient);
         const emailIdentifier = extractTokenFromLocal(recipientLocal);
@@ -85,28 +67,32 @@ app.post("/webhooks/email/mailgun", async (req, res) => {
         if (!apiKey) throw new Error("Missing BASE44_API_KEY");
         const base44 = createClient({ apiKey });
 
-        // 3. Find User
-        const user = await findUserByEmailId(base44, emailIdentifier);
-        if (!user) throw new Error(`User not found for email identifier: ${emailIdentifier}`);
-        console.log(`Found user: ${user.id}`);
+        // 3. Find User and their Fallback Deal info
+        const fallbackInfo = await findUserAndFallbackDeal(base44, emailIdentifier);
+        if (!fallbackInfo) throw new Error(`User/FallbackDeal not found for identifier: ${emailIdentifier}`);
+        console.log(`Found user and fallback info:`, fallbackInfo);
 
-        // 4. Find or Create Dealer
-        const vin = extractVIN(content);
-        const dealerName = extractDealerName(content);
-        const dealerId = await findOrCreateDealer(base44, dealerName, sender);
-        if (!dealerId) throw new Error("Failed to find or create a dealer.");
-
-        // 5. Invoke the Base44 function with all required IDs
+        // 4. Invoke the Base44 function with guaranteed IDs
+        const vin = extractVIN(content); // Still useful for the function to try matching
+        
         const functionPayload = {
             sender,
             subject,
             content,
             vin,
-            dealer_id: dealerId,
-            user_id: user.id, // Pass user_id for message ownership
+            dealer_id: fallbackInfo.dealerId, // Use the fallback dealer
+            user_id: fallbackInfo.userId,
             raw_data: req.body
         };
 
+        // Even if VIN matching works, we can still use the fallback dealer_id.
+        // The deal_id inside the function will be correctly assigned if a match is found.
+        if (vin) {
+            functionPayload.deal_id = null; // Let the function find the deal
+        } else {
+            functionPayload.deal_id = fallbackInfo.dealId; // No VIN, so assign to fallback deal
+        }
+        
         await base44.functions.invoke("messageProcessor", functionPayload);
         console.log("✅ Successfully invoked messageProcessor function.");
 
