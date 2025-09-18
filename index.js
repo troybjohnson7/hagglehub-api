@@ -1,15 +1,9 @@
 // index.js
 // HaggleHub API — Mailgun -> Render -> Base44 function (messageProcessor)
-// - ACKs Mailgun immediately
-// - Trims bodies to avoid LLM/context overflows
-// - Sends aliasToken, userToken, vin, dealerName, preview
-// - Sets safeMode: true to let Base44 skip connecting undefined relations
-//
-// ENV on Render:
-//   BASE44_API_KEY = <your Base44 project API key>
-// Optional:
-//   CORS_ORIGIN = https://hagglehub.app
-//   MAX_BODY_LENGTH = 4000
+// Aligns with Base44 Users.email_identifier by sending:
+//   - email_identifier: "<token>"
+//   - recipientLocal: "<token>"        (trimmed; NOT "deals-<token>")
+// Also sends recipientLocalRaw: "deals-<token>" for debugging.
 
 import express from "express";
 import cors from "cors";
@@ -36,10 +30,11 @@ function splitRecipient(recipient) {
   }
   return { local, domain };
 }
-function extractAliasToken(recipientLocal) {
-  if (!recipientLocal) return "";
-  const m = recipientLocal.match(/^deals?-(.+)$/i); // deals-XYZ or deal-XYZ
-  return m ? m[1] : "";
+function extractTokenFromLocal(localPart) {
+  // deals-<token> or deal-<token> -> <token>
+  if (!localPart) return "";
+  const m = localPart.match(/^deals?-(.+)$/i);
+  return m ? m[1] : localPart; // if already token, return as-is
 }
 function trimBody(s, maxLen) {
   if (!s) return "";
@@ -62,7 +57,6 @@ function extractDealerName(text) {
   if (name.toLowerCase() === "me" || name.toLowerCase() === "us") return "";
   return name.slice(0, 80);
 }
-// tiny retry helper for transient 5xx
 async function invokeWithRetry(fn, tries = 2, delayMs = 350) {
   let lastErr;
   for (let i = 0; i < tries; i++) {
@@ -78,6 +72,11 @@ async function invokeWithRetry(fn, tries = 2, delayMs = 350) {
   }
   throw lastErr;
 }
+function pick(obj, keys) {
+  const out = {};
+  for (const k of keys) if (obj?.[k] !== undefined) out[k] = obj[k];
+  return out;
+}
 
 // ---------- webhook ----------
 app.post("/webhooks/email/mailgun", async (req, res) => {
@@ -89,8 +88,8 @@ app.post("/webhooks/email/mailgun", async (req, res) => {
   const recipient  = req.body.recipient || req.body.to || req.body["To"] || "";
   const messageId  = req.body["message-id"] || req.body["Message-Id"] || req.body["Message-ID"] || "";
 
-  const { local: recipientLocal, domain: recipientDomain } = splitRecipient(recipient);
-  const aliasToken = extractAliasToken(recipientLocal);
+  const { local: recipientLocalRaw, domain: recipientDomain } = splitRecipient(recipient);
+  const token = extractTokenFromLocal(recipientLocalRaw); // <- "p8j5o5u"
 
   // 2) Trim bodies to keep payload LLM-friendly
   const MAX_LEN = Number(process.env.MAX_BODY_LENGTH || 4000);
@@ -110,7 +109,8 @@ app.post("/webhooks/email/mailgun", async (req, res) => {
     sender,
     subject,
     recipient,
-    recipientLocal,
+    recipientLocal: token,        // trimmed token shown prominently
+    recipientLocalRaw,            // original local part e.g., "deals-p8j5o5u"
     messageId,
     textLen: trimmedText.length,
     htmlLen: trimmedHtml.length,
@@ -119,7 +119,7 @@ app.post("/webhooks/email/mailgun", async (req, res) => {
     preview
   });
 
-  // 5) Invoke Base44 function with rich, safe payload
+  // 5) Invoke Base44 function with aligned keys
   try {
     const apiKey = process.env.BASE44_API_KEY;
     if (!apiKey) {
@@ -128,51 +128,91 @@ app.post("/webhooks/email/mailgun", async (req, res) => {
     }
     const base44 = createClient({ apiKey });
 
+    // Aligns with Users.email_identifier
     const payload = {
+      // addressing / identity
+      email_identifier: token,         // <-- canonical field in your Users table
+      recipientLocal: token,           // <-- match their earlier function test (trimmed)
+      recipientLocalRaw,               // <-- for debugging, optional
+      recipientDomain,
+      senderEmail: sender,
+      recipientEmail: recipient,
+
       // core routing
       channel: "email",
       direction: "in",
-      // addressing
-      senderEmail: sender,
-      recipientEmail: recipient,
-      recipientLocal,
-      recipientDomain,
-      aliasToken,
-      userToken: aliasToken,             // extra key some backends expect
+
       // content
       subject,
       textBody: trimmedText,
       htmlBody: trimmedHtml,
       preview,
+
       // matching hints
       vin,
       dealerName,
+
       // meta / idempotency
       externalId: messageId,
       receivedAt: new Date().toISOString(),
       source: "mailgun",
+
+      // convenience aliases some backends expect
+      aliasToken: token,
+      userToken: token,
+
       // instruct backend to avoid connecting undefined relations
       safeMode: true
     };
 
-    const resp = await invokeWithRetry(() =>
+    const baseInvoke = () =>
       base44.functions.invoke("messageProcessor", {
         input: "Process inbound email and attach to the correct user/deal.",
-        session_id: messageId || `mailgun-${recipientLocal || "unknown"}-${Date.now()}`,
+        session_id: messageId || `mailgun-${token || "unknown"}-${Date.now()}`,
         data: payload
-      })
-    );
+      });
 
-    console.log("Base44 messageProcessor → OK", resp);
-  } catch (err) {
-    const safe = {
-      name: err?.name || null,
-      message: err?.message || String(err),
-      status: err?.status || err?.response?.status || null,
-      data: err?.response?.data || err?.data || null,
-      code: err?.code || null
-    };
-    console.error("Base44 forward error:", JSON.stringify(safe, null, 2));
+    try {
+      const resp = await invokeWithRetry(baseInvoke);
+      console.log("Base44 messageProcessor → OK", resp);
+    } catch (err) {
+      // If Base44 returns ObjectNotFoundError, re-invoke with attachNone=true as an escape hatch
+      const status = err?.status || err?.response?.status;
+      const data = err?.response?.data || err?.data || {};
+      const errorType = data?.error_type || data?.errorType;
+
+      console.error("Base44 forward error (first attempt):", JSON.stringify({
+        name: err?.name || null,
+        message: err?.message || String(err),
+        status,
+        data: pick(data, ["error_type", "errorType", "message", "detail", "traceback"]),
+        code: err?.code || null
+      }, null, 2));
+
+      if (status === 500 && (errorType === "ObjectNotFoundError" || /ObjectNotFound/i.test(data?.message || ""))) {
+        const payload2 = { ...payload, attachNone: true };
+        try {
+          const resp2 = await base44.functions.invoke("messageProcessor", {
+            input: "Ingest only; do not connect relations.",
+            session_id: (messageId || `mailgun-${token || "unknown"}-${Date.now()}`) + "-fallback",
+            data: payload2
+          });
+          console.log("Base44 messageProcessor (fallback attachNone) → OK", resp2);
+        } catch (err2) {
+          const status2 = err2?.status || err2?.response?.status;
+          const data2 = err2?.response?.data || err2?.data || {};
+          console.error("Base44 forward error (fallback):", JSON.stringify({
+            name: err2?.name || null,
+            message: err2?.message || String(err2),
+            status: status2,
+            data: pick(data2, ["error_type", "errorType", "message", "detail", "traceback"]),
+            code: err2?.code || null
+          }, null, 2));
+        }
+      }
+    }
+  } catch (errOuter) {
+    console.error("Base44 invoke wrapper error:", errOuter?.message || String(errOuter));
   }
 });
 
