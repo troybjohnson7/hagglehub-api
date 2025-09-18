@@ -1,9 +1,18 @@
 // index.js
-// HaggleHub API — Mailgun -> Render -> Base44 function (messageProcessor)
-// Aligns with Base44 Users.email_identifier by sending:
-//   - email_identifier: "<token>"
-//   - recipientLocal: "<token>"        (trimmed; NOT "deals-<token>")
-// Also sends recipientLocalRaw: "deals-<token>" for debugging.
+// HaggleHub API — Mailgun -> Render -> Base44
+// Primary: invoke Base44 function "messageProcessor"
+// Fallback on 500/ObjectNotFoundError: upsert Dealer, then create Message
+//
+// Message schema requires: dealer_id, direction, content
+// deal_id may be null (uncategorized)
+// We'll map: direction="inbound", channel="email", content=(text or stripped html),
+// subject, sender_contact, is_read=false, raw_data=<original payload>
+//
+// ENV on Render:
+//   BASE44_API_KEY = <your Base44 project API key>
+// Optional:
+//   CORS_ORIGIN = https://hagglehub.app
+//   MAX_BODY_LENGTH = 4000
 
 import express from "express";
 import cors from "cors";
@@ -34,12 +43,23 @@ function extractTokenFromLocal(localPart) {
   // deals-<token> or deal-<token> -> <token>
   if (!localPart) return "";
   const m = localPart.match(/^deals?-(.+)$/i);
-  return m ? m[1] : localPart; // if already token, return as-is
+  return m ? m[1] : localPart;
 }
 function trimBody(s, maxLen) {
   if (!s) return "";
   const str = String(s);
   return str.length > maxLen ? str.slice(0, maxLen) : str;
+}
+function stripHtml(html) {
+  if (!html) return "";
+  return String(html)
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">");
 }
 // VIN: 17 chars, excluding I,O,Q
 function extractVIN(text) {
@@ -78,6 +98,54 @@ function pick(obj, keys) {
   return out;
 }
 
+// ---------- Base44 fallback helpers ----------
+async function findDealerIdByName(base44, name) {
+  if (!name) return null;
+  try {
+    const res = await base44.entities.Dealer.list({
+      where: { name }, // adjust if your Dealer uses a different field
+      limit: 1
+    });
+    if (res?.items?.length) return res.items[0].id;
+  } catch (e) {}
+  return null;
+}
+
+async function ensureDealer(base44, name) {
+  // Try exact name; if blank, default to "Unknown Dealer"
+  const safeName = name && name.trim() ? name.trim() : "Unknown Dealer";
+  let id = await findDealerIdByName(base44, safeName);
+  if (id) return id;
+
+  // Attempt to create Dealer with minimal fields
+  try {
+    const created = await base44.entities.Dealer.create({
+      data: { name: safeName }
+    });
+    return created.id;
+  } catch (e) {
+    console.error("Fallback: Dealer.create failed:", e?.message || String(e));
+    return null;
+  }
+}
+
+async function createMessageDirect(base44, { dealer_id, subject, content, sender_contact, raw_data }) {
+  // Map exactly to your Message entity fields
+  const data = {
+    dealer_id,                 // required
+    direction: "inbound",      // required
+    channel: "email",
+    subject: subject || "",
+    content: content || "",    // required
+    sender_contact: sender_contact || "",
+    is_read: false,
+    raw_data: raw_data || {}
+  };
+
+  // Try straightforward create
+  return base44.entities.Message.create({ data });
+}
+
 // ---------- webhook ----------
 app.post("/webhooks/email/mailgun", async (req, res) => {
   // 1) Extract Mailgun fields
@@ -88,29 +156,29 @@ app.post("/webhooks/email/mailgun", async (req, res) => {
   const recipient  = req.body.recipient || req.body.to || req.body["To"] || "";
   const messageId  = req.body["message-id"] || req.body["Message-Id"] || req.body["Message-ID"] || "";
 
-  const { local: recipientLocalRaw, domain: recipientDomain } = splitRecipient(recipient);
-  const token = extractTokenFromLocal(recipientLocalRaw); // <- "p8j5o5u"
+  const { local: recipientLocalRaw } = splitRecipient(recipient);
+  const token = extractTokenFromLocal(recipientLocalRaw); // e.g., "p8j5o5u"
 
-  // 2) Trim bodies to keep payload LLM-friendly
+  // 2) Build safe bodies & content
   const MAX_LEN = Number(process.env.MAX_BODY_LENGTH || 4000);
   const trimmedText = trimBody(textBody, MAX_LEN);
   const trimmedHtml = trimBody(htmlBody, MAX_LEN);
   const preview = (trimmedText || trimmedHtml).toString().slice(0, 160);
+  const content = trimmedText || stripHtml(trimmedHtml) || preview || "(no content)";
 
-  // 3) Extra hints for Base44 matching
+  // 3) Extra hints
   const vin = extractVIN(trimmedText || trimmedHtml);
   const dealerName = extractDealerName(trimmedText || trimmedHtml);
 
-  // 4) ACK Mailgun immediately (prevent retries)
+  // 4) ACK Mailgun immediately
   res.status(200).send("OK");
 
-  // Log concise summary
   console.log("Inbound email:", {
     sender,
     subject,
     recipient,
-    recipientLocal: token,        // trimmed token shown prominently
-    recipientLocalRaw,            // original local part e.g., "deals-p8j5o5u"
+    recipientLocal: token,   // trimmed token matches Users.email_identifier
+    recipientLocalRaw,       // original local part
     messageId,
     textLen: trimmedText.length,
     htmlLen: trimmedHtml.length,
@@ -119,32 +187,31 @@ app.post("/webhooks/email/mailgun", async (req, res) => {
     preview
   });
 
-  // 5) Invoke Base44 function with aligned keys
+  // 5) Call Base44 function first
   try {
     const apiKey = process.env.BASE44_API_KEY;
     if (!apiKey) {
-      console.error("Missing BASE44_API_KEY — cannot invoke Base44 function");
+      console.error("Missing BASE44_API_KEY — cannot invoke Base44");
       return;
     }
     const base44 = createClient({ apiKey });
 
-    // Aligns with Users.email_identifier
     const payload = {
-      // addressing / identity
-      email_identifier: token,         // <-- canonical field in your Users table
-      recipientLocal: token,           // <-- match their earlier function test (trimmed)
-      recipientLocalRaw,               // <-- for debugging, optional
-      recipientDomain,
+      // identity / addressing
+      email_identifier: token,      // your Users table canonical id
+      recipientLocal: token,
+      recipientLocalRaw,
       senderEmail: sender,
       recipientEmail: recipient,
 
       // core routing
       channel: "email",
-      direction: "in",
+      direction: "inbound",         // matches your enum
 
       // content
       subject,
-      textBody: trimmedText,
+      content,                       // send content too (function can use it)
+      textBody: trimmedText,         // still provide as hints
       htmlBody: trimmedHtml,
       preview,
 
@@ -157,7 +224,7 @@ app.post("/webhooks/email/mailgun", async (req, res) => {
       receivedAt: new Date().toISOString(),
       source: "mailgun",
 
-      // convenience aliases some backends expect
+      // convenience aliases
       aliasToken: token,
       userToken: token,
 
@@ -165,7 +232,7 @@ app.post("/webhooks/email/mailgun", async (req, res) => {
       safeMode: true
     };
 
-    const baseInvoke = () =>
+    const callFn = () =>
       base44.functions.invoke("messageProcessor", {
         input: "Process inbound email and attach to the correct user/deal.",
         session_id: messageId || `mailgun-${token || "unknown"}-${Date.now()}`,
@@ -173,15 +240,15 @@ app.post("/webhooks/email/mailgun", async (req, res) => {
       });
 
     try {
-      const resp = await invokeWithRetry(baseInvoke);
+      const resp = await invokeWithRetry(callFn);
       console.log("Base44 messageProcessor → OK", resp);
+      return; // success path
     } catch (err) {
-      // If Base44 returns ObjectNotFoundError, re-invoke with attachNone=true as an escape hatch
       const status = err?.status || err?.response?.status;
       const data = err?.response?.data || err?.data || {};
       const errorType = data?.error_type || data?.errorType;
 
-      console.error("Base44 forward error (first attempt):", JSON.stringify({
+      console.error("Base44 forward error (function):", JSON.stringify({
         name: err?.name || null,
         message: err?.message || String(err),
         status,
@@ -189,25 +256,41 @@ app.post("/webhooks/email/mailgun", async (req, res) => {
         code: err?.code || null
       }, null, 2));
 
+      // ---------- Fallback: upsert Dealer, then create Message ----------
       if (status === 500 && (errorType === "ObjectNotFoundError" || /ObjectNotFound/i.test(data?.message || ""))) {
-        const payload2 = { ...payload, attachNone: true };
         try {
-          const resp2 = await base44.functions.invoke("messageProcessor", {
-            input: "Ingest only; do not connect relations.",
-            session_id: (messageId || `mailgun-${token || "unknown"}-${Date.now()}`) + "-fallback",
-            data: payload2
+          // Prefer parsed dealerName; if empty, use "Unknown Dealer"
+          const dealer_id = await ensureDealer(base44, dealerName || "Unknown Dealer");
+          if (!dealer_id) {
+            console.error("Fallback: could not ensure Dealer (dealer_id missing). Message not recorded.");
+            return;
+          }
+
+          const raw_data = {
+            sender,
+            subject,
+            recipient,
+            recipientLocal: recipientLocalRaw, // keep original
+            token,
+            messageId,
+            textLen: trimmedText.length,
+            htmlLen: trimmedHtml.length,
+            vin,
+            dealerName,
+            preview
+          };
+
+          const created = await createMessageDirect(base44, {
+            dealer_id,
+            subject,
+            content,
+            sender_contact: sender,
+            raw_data
           });
-          console.log("Base44 messageProcessor (fallback attachNone) → OK", resp2);
+
+          console.log("Fallback: Message.create → OK", { id: created.id, dealer_id });
         } catch (err2) {
-          const status2 = err2?.status || err2?.response?.status;
-          const data2 = err2?.response?.data || err2?.data || {};
-          console.error("Base44 forward error (fallback):", JSON.stringify({
-            name: err2?.name || null,
-            message: err2?.message || String(err2),
-            status: status2,
-            data: pick(data2, ["error_type", "errorType", "message", "detail", "traceback"]),
-            code: err2?.code || null
-          }, null, 2));
+          console.error("Fallback path failed:", err2?.message || String(err2));
         }
       }
     }
