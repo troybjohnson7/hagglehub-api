@@ -1,4 +1,4 @@
-// index.js for Render - FINAL VERSION
+// index.js for Render - FINAL VERSION 2
 // HaggleHub API — Mailgun -> Render -> Base44
 
 import express from "express";
@@ -41,8 +41,11 @@ async function findUserByEmailId(base44, emailIdentifier) {
     return items?.[0] || null;
 }
 
-async function findOrCreateDealer(base44, dealerName, sender, userId) {
+async function findOrCreateDealer(base44, dealerName, sender) {
     const safeName = dealerName?.trim() || sender.split('@')[0].replace(/[._-]/g, ' ').trim();
+    if (!safeName) { // Final check for a valid name
+        throw new Error("Could not determine a valid dealer name from sender email.");
+    }
     const { items } = await base44.entities.Dealer.list({ where: { name: safeName }, limit: 1 });
     if (items?.[0]?.id) {
         console.log(`Found existing dealer: ${safeName} (ID: ${items[0].id})`);
@@ -50,8 +53,9 @@ async function findOrCreateDealer(base44, dealerName, sender, userId) {
     }
     
     console.log(`Creating new dealer: ${safeName}`);
+    // FIX: DO NOT specify created_by. The service key will own this record.
     const newDealer = await base44.entities.Dealer.create({
-        data: { name: safeName, contact_email: sender, created_by: userId }
+        data: { name: safeName, contact_email: sender }
     });
     return newDealer.id;
 }
@@ -89,7 +93,7 @@ app.post("/webhooks/email/mailgun", async (req, res) => {
         // 4. Find or Create Dealer
         const vin = extractVIN(content);
         const dealerName = extractDealerName(content);
-        const dealerId = await findOrCreateDealer(base44, dealerName, sender, user.id);
+        const dealerId = await findOrCreateDealer(base44, dealerName, sender);
         if (!dealerId) throw new Error("Failed to find or create a dealer.");
 
         // 5. Invoke the Base44 function with all required IDs
@@ -99,7 +103,7 @@ app.post("/webhooks/email/mailgun", async (req, res) => {
             content,
             vin,
             dealer_id: dealerId,
-            user_id: user.id,
+            user_id: user.id, // Pass user_id for message ownership
             raw_data: req.body
         };
 
