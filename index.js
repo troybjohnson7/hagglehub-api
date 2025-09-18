@@ -1,6 +1,14 @@
 // index.js
-// HaggleHub API — Mailgun -> Render -> Base44 (functions.invoke)
-// Trims bodies to avoid LLM/agent overflows that cause 500s.
+// HaggleHub API — Mailgun -> Render -> Base44 function (messageProcessor)
+// - ACKs Mailgun immediately
+// - Trims bodies to avoid LLM/context overflows
+// - Invokes Base44 function "messageProcessor" with a clean payload
+//
+// ENV on Render:
+//   BASE44_API_KEY = <your Base44 project API key>
+// Optional:
+//   CORS_ORIGIN = https://hagglehub.app
+//   MAX_BODY_LENGTH = 4000
 
 import express from "express";
 import cors from "cors";
@@ -48,15 +56,15 @@ app.post("/webhooks/email/mailgun", async (req, res) => {
 
   const { local: recipientLocal, domain: recipientDomain } = splitRecipient(recipient);
 
-  // 2) Trim bodies to keep payload LLM-friendly (defaults to 4000; can override via env)
+  // 2) Trim bodies to keep payload LLM-friendly
   const MAX_LEN = Number(process.env.MAX_BODY_LENGTH || 4000);
   const trimmedText = trimBody(textBody, MAX_LEN);
   const trimmedHtml = trimBody(htmlBody, MAX_LEN);
 
-  // 3) ACK Mailgun immediately (no retries)
+  // 3) ACK Mailgun immediately (so it won't retry even if Base44 is slow)
   res.status(200).send("OK");
 
-  // Log a concise summary (lengths help diagnose payload size issues)
+  // Log a concise summary
   console.log("Inbound email:", {
     sender,
     subject,
@@ -68,7 +76,7 @@ app.post("/webhooks/email/mailgun", async (req, res) => {
     preview: (trimmedText || trimmedHtml).toString().slice(0, 160)
   });
 
-  // 4) Invoke Base44 function (agent) with trimmed payload
+  // 4) Invoke Base44 function: messageProcessor
   try {
     const apiKey = process.env.BASE44_API_KEY;
     if (!apiKey) {
@@ -91,13 +99,13 @@ app.post("/webhooks/email/mailgun", async (req, res) => {
       source: "mailgun"
     };
 
-    const resp = await base44.functions.invoke("message_processor", {
+    const resp = await base44.functions.invoke("messageProcessor", {
       input: "Process inbound email and attach to the correct user/deal.",
       session_id: messageId || `mailgun-${recipientLocal || "unknown"}-${Date.now()}`,
       data: payload
     });
 
-    console.log("Base44 message_processor → OK", resp);
+    console.log("Base44 messageProcessor → OK", resp);
   } catch (err) {
     // Print structured error details if available
     const safe = {
