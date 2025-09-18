@@ -1,10 +1,6 @@
 // index.js
-// HaggleHub API — Mailgun -> Render -> Base44 (invoke message_processor agent)
-
-// ENV on Render:
-//   BASE44_API_KEY = <your Base44 project API key>
-// Optional:
-//   CORS_ORIGIN = https://hagglehub.app
+// HaggleHub API — Mailgun -> Render -> Base44 (functions.invoke)
+// Trims bodies to avoid LLM/agent overflows that cause 500s.
 
 import express from "express";
 import cors from "cors";
@@ -15,13 +11,13 @@ const app = express();
 // --- Middleware ---
 app.use(cors({ origin: process.env.CORS_ORIGIN || "*" }));
 app.use(express.json());
-app.use(express.urlencoded({ extended: false })); // Mailgun sends form-encoded
+app.use(express.urlencoded({ extended: false })); // Mailgun posts form-encoded
 
-// --- Health endpoints ---
+// --- Health ---
 app.get("/", (_req, res) => res.send("HaggleHub API is running."));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-// --- Helper: split recipient email ---
+// --- Helpers ---
 function splitRecipient(recipient) {
   let local = "", domain = "";
   if (recipient && recipient.includes("@")) {
@@ -32,7 +28,15 @@ function splitRecipient(recipient) {
   return { local, domain };
 }
 
+function trimBody(s, maxLen) {
+  if (!s) return "";
+  const str = String(s);
+  return str.length > maxLen ? str.slice(0, maxLen) : str;
+}
+
 // --- Mailgun Inbound Webhook ---
+// Mailgun Route action:
+//   forward("https://api.hagglehub.app/webhooks/email/mailgun"); stop()
 app.post("/webhooks/email/mailgun", async (req, res) => {
   // 1) Extract Mailgun fields
   const sender     = req.body.sender || req.body.from || req.body["From"] || "";
@@ -44,29 +48,35 @@ app.post("/webhooks/email/mailgun", async (req, res) => {
 
   const { local: recipientLocal, domain: recipientDomain } = splitRecipient(recipient);
 
-  // 2) ACK Mailgun immediately (prevent retries)
+  // 2) Trim bodies to keep payload LLM-friendly (defaults to 4000; can override via env)
+  const MAX_LEN = Number(process.env.MAX_BODY_LENGTH || 4000);
+  const trimmedText = trimBody(textBody, MAX_LEN);
+  const trimmedHtml = trimBody(htmlBody, MAX_LEN);
+
+  // 3) ACK Mailgun immediately (no retries)
   res.status(200).send("OK");
 
-  // Log inbound
+  // Log a concise summary (lengths help diagnose payload size issues)
   console.log("Inbound email:", {
     sender,
     subject,
     recipient,
     recipientLocal,
     messageId,
-    preview: (textBody || htmlBody || "").toString().slice(0, 160)
+    textLen: trimmedText.length,
+    htmlLen: trimmedHtml.length,
+    preview: (trimmedText || trimmedHtml).toString().slice(0, 160)
   });
 
-  // 3) Forward to Base44 by invoking the agent
+  // 4) Invoke Base44 function (agent) with trimmed payload
   try {
     const apiKey = process.env.BASE44_API_KEY;
     if (!apiKey) {
-      console.error("Missing BASE44_API_KEY — cannot invoke Base44 agent");
+      console.error("Missing BASE44_API_KEY — cannot invoke Base44 function");
       return;
     }
     const base44 = createClient({ apiKey });
 
-    // Payload for your agent
     const payload = {
       channel: "email",
       direction: "in",
@@ -75,24 +85,32 @@ app.post("/webhooks/email/mailgun", async (req, res) => {
       recipientLocal,
       recipientDomain,
       subject,
-      textBody: textBody || "",
-      htmlBody: htmlBody || "",
-      externalId: messageId
+      textBody: trimmedText,
+      htmlBody: trimmedHtml,
+      externalId: messageId,
+      source: "mailgun"
     };
 
-    // Correct method for external integration
     const resp = await base44.functions.invoke("message_processor", {
       input: "Process inbound email and attach to the correct user/deal.",
-      session_id: messageId || `mailgun-${recipientLocal}-${Date.now()}`,
+      session_id: messageId || `mailgun-${recipientLocal || "unknown"}-${Date.now()}`,
       data: payload
     });
 
-    console.log("Forwarded to Base44 message_processor → OK", resp);
+    console.log("Base44 message_processor → OK", resp);
   } catch (err) {
-    console.error("Base44 forward error:", err && err.message ? err.message : String(err));
+    // Print structured error details if available
+    const safe = {
+      name: err?.name || null,
+      message: err?.message || String(err),
+      status: err?.status || err?.response?.status || null,
+      data: err?.response?.data || err?.data || null,
+      code: err?.code || null
+    };
+    console.error("Base44 forward error:", JSON.stringify(safe, null, 2));
   }
 });
 
-// --- Start server ---
+// --- Start server (Render sets PORT) ---
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`HaggleHub API listening on ${PORT}`));
