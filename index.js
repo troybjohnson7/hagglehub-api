@@ -1,4 +1,4 @@
-// index.js - Direct HTTP with better error handling
+// index.js - Direct Entity API approach
 import express from "express";
 import cors from "cors";
 
@@ -25,48 +25,72 @@ const extractTokenFromLocal = (localPart) => {
 const stripHtml = (html) => (html || "").replace(/<[^>]+>/g, "");
 const extractVIN = (text) => text?.match(/\b([A-HJ-NPR-Z0-9]{17})\b/i)?.[1].toUpperCase() || "";
 
-// --- Base44 API Call Function (More Robust) ---
-async function callBase44Function(functionName, payload) {
+// --- Base44 Entity API Functions ---
+async function callBase44API(endpoint, method = 'GET', body = null) {
   const apiKey = process.env.BASE44_API_KEY;
   const projectId = process.env.BASE44_PROJECT_ID;
 
-  // 1. Explicitly check for required environment variables
-  if (!apiKey) throw new Error("CRITICAL: Missing BASE44_API_KEY environment variable.");
-  if (!projectId) throw new Error("CRITICAL: Missing BASE44_PROJECT_ID environment variable.");
+  if (!apiKey) throw new Error("Missing BASE44_API_KEY");
+  if (!projectId) throw new Error("Missing BASE44_PROJECT_ID");
 
-  const url = `https://api.base44.com/projects/${projectId}/functions/${functionName}/invoke`;
-  console.log(`Calling Base44 function: ${functionName}`);
-
-  try {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(payload)
-    });
-
-    if (!response.ok) {
-      let errorBody;
-      try {
-        errorBody = await response.json();
-      } catch (e) {
-        errorBody = await response.text();
-      }
-      throw new Error(`Base44 API returned an error. Status: ${response.status}. Body: ${JSON.stringify(errorBody)}`);
+  const url = `https://app.base44.com/api/projects/${projectId}${endpoint}`;
+  
+  const options = {
+    method,
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json'
     }
+  };
 
+  if (body && (method === 'POST' || method === 'PUT' || method === 'PATCH')) {
+    options.body = JSON.stringify(body);
+  }
+
+  console.log(`Calling Base44 API: ${method} ${url}`);
+  
+  try {
+    const response = await fetch(url, options);
+    
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Base44 API error ${response.status}: ${errorText}`);
+    }
+    
     return response.json();
   } catch (error) {
-    // 2. Add more detail if the 'fetch' itself fails
-    if (error.message.includes('fetch failed') || error.cause) {
-      console.error('Detailed network error cause:', error.cause);
-      throw new Error(`Network-level error ('fetch failed') when trying to reach Base44 API. URL: ${url}. Please verify networking settings on Render and check that the BASE44_PROJECT_ID is correct.`);
+    if (error.message.includes('ENOTFOUND')) {
+      throw new Error(`DNS lookup failed for Base44 API. Check if app.base44.com is accessible.`);
     }
-    // Re-throw other errors
     throw error;
   }
+}
+
+async function findUserByEmailId(emailIdentifier) {
+  const users = await callBase44API(`/entities/User?filter=${encodeURIComponent(`email_identifier="${emailIdentifier}"`)}&limit=1`);
+  return users.items?.[0] || null;
+}
+
+async function findOrCreateDealer(dealerName, senderEmail) {
+  const safeName = dealerName || senderEmail.split('@')[0].replace(/[._-]/g, ' ');
+  
+  // Try to find existing dealer
+  const existingDealers = await callBase44API(`/entities/Dealer?filter=${encodeURIComponent(`name="${safeName}"`)}&limit=1`);
+  if (existingDealers.items?.[0]) {
+    return existingDealers.items[0];
+  }
+  
+  // Create new dealer
+  const newDealer = await callBase44API('/entities/Dealer', 'POST', {
+    name: safeName,
+    contact_email: senderEmail
+  });
+  
+  return newDealer;
+}
+
+async function createMessage(messageData) {
+  return callBase44API('/entities/Message', 'POST', messageData);
 }
 
 // --- Main Webhook ---
@@ -87,24 +111,44 @@ app.post("/webhooks/email/mailgun", async (req, res) => {
 
     console.log(`Processing email for identifier: ${emailIdentifier}`);
     
-    const functionPayload = {
-      sender,
-      subject,
-      content,
-      recipient,
-      recipientLocal,
-      emailIdentifier,
-      vin,
+    // 1. Find user
+    const user = await findUserByEmailId(emailIdentifier);
+    if (!user) {
+      console.log(`User not found for email identifier: ${emailIdentifier}`);
+      return;
+    }
+    
+    console.log(`Found user: ${user.id}`);
+    
+    // 2. Find or create dealer
+    const dealer = await findOrCreateDealer(extractDealerName(content), sender);
+    console.log(`Using dealer: ${dealer.id} (${dealer.name})`);
+    
+    // 3. Create message - use fallback deal if available
+    const messageData = {
+      deal_id: user.fallback_deal_id || null,
+      dealer_id: dealer.id,
+      direction: 'inbound',
+      channel: 'email',
+      subject: subject,
+      content: content,
+      is_read: false,
       raw_data: req.body
     };
-
-    const result = await callBase44Function("messageProcessor", functionPayload);
-    console.log("✅ Email processed successfully:", result);
+    
+    const message = await createMessage(messageData);
+    console.log("✅ Message created successfully:", message.id);
 
   } catch (error) {
     console.error("❌ Email processing failed:", error.message);
   }
 });
+
+function extractDealerName(text) {
+  const name = text?.match(/from\s+([\w\s&.,''\-]+?)(?:[\.\n\r]|$)/i)?.[1]?.trim();
+  if (!name || ["me", "us"].includes(name.toLowerCase())) return "";
+  return name.slice(0, 80);
+}
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
