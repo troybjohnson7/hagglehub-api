@@ -1,4 +1,4 @@
-// index.js - Direct HTTP approach (no SDK dependency)
+// index.js - Direct HTTP with better error handling
 import express from "express";
 import cors from "cors";
 
@@ -9,6 +9,7 @@ app.use(express.urlencoded({ extended: false }));
 
 app.get("/", (_req, res) => res.send("HaggleHub API is running."));
 
+// --- Helper Functions ---
 const splitRecipient = (recipient) => {
   if (!recipient || !recipient.includes("@")) return { local: "", domain: "" };
   const [local, domain] = recipient.split("@", 2);
@@ -24,29 +25,51 @@ const extractTokenFromLocal = (localPart) => {
 const stripHtml = (html) => (html || "").replace(/<[^>]+>/g, "");
 const extractVIN = (text) => text?.match(/\b([A-HJ-NPR-Z0-9]{17})\b/i)?.[1].toUpperCase() || "";
 
+// --- Base44 API Call Function (More Robust) ---
 async function callBase44Function(functionName, payload) {
   const apiKey = process.env.BASE44_API_KEY;
-  if (!apiKey) throw new Error("Missing BASE44_API_KEY");
+  const projectId = process.env.BASE44_PROJECT_ID;
 
-  const url = `https://api.base44.com/projects/${process.env.BASE44_PROJECT_ID}/functions/${functionName}/invoke`;
-  
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify(payload)
-  });
+  // 1. Explicitly check for required environment variables
+  if (!apiKey) throw new Error("CRITICAL: Missing BASE44_API_KEY environment variable.");
+  if (!projectId) throw new Error("CRITICAL: Missing BASE44_PROJECT_ID environment variable.");
 
-  if (!response.ok) {
-    const error = await response.json();
-    throw new Error(`Base44 function call failed: ${JSON.stringify(error)}`);
+  const url = `https://api.base44.com/projects/${projectId}/functions/${functionName}/invoke`;
+  console.log(`Calling Base44 function: ${functionName}`);
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    });
+
+    if (!response.ok) {
+      let errorBody;
+      try {
+        errorBody = await response.json();
+      } catch (e) {
+        errorBody = await response.text();
+      }
+      throw new Error(`Base44 API returned an error. Status: ${response.status}. Body: ${JSON.stringify(errorBody)}`);
+    }
+
+    return response.json();
+  } catch (error) {
+    // 2. Add more detail if the 'fetch' itself fails
+    if (error.message.includes('fetch failed') || error.cause) {
+      console.error('Detailed network error cause:', error.cause);
+      throw new Error(`Network-level error ('fetch failed') when trying to reach Base44 API. URL: ${url}. Please verify networking settings on Render and check that the BASE44_PROJECT_ID is correct.`);
+    }
+    // Re-throw other errors
+    throw error;
   }
-
-  return response.json();
 }
 
+// --- Main Webhook ---
 app.post("/webhooks/email/mailgun", async (req, res) => {
   res.status(200).send("OK");
 
