@@ -28,20 +28,23 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
 // ===== In-memory data (MVP) =====
-// Give each deal a stable human-friendly token "key"
+// Add VIN / dealerEmailDomain if you have them, helps auto-match
 const deals = [
   {
     id: 1,
-    key: "p8j5o5u",              // TOKEN visible in proxy email e.g., deals-p8j5o5u@...
+    key: "p8j5o5u",
     dealerName: "Test Dealer",
+    dealerEmailDomain: "dealer.com",   // optional
     vehicleTitle: "Sample Car",
-    url: "",
+    vin: "1ABCDEFG2HIJKL345",           // optional (17 chars)
+    url: "https://dealer.com/inventory/sample-car",
     status: "open",
     best_offer_otd: null,
   }
 ];
 
-const messages = []; // { id, dealId, channel, direction, body, meta, createdAt }
+const messages = []; // { id, dealId|null, channel, direction, body, meta, createdAt }
+
 
 // Helper: build the proxy email for a deal
 function dealProxyEmail(deal) {
@@ -56,6 +59,67 @@ function findDealByParam(param) {
     return deals.find(d => d.id === n) || null;
   }
   return deals.find(d => d.key === param) || null;
+}
+
+// Build proxy email (unchanged)
+function dealProxyEmail(deal) {
+  const domain = process.env.MAILGUN_DOMAIN || "hagglehub.app";
+  return `deals-${deal.key}@${domain}`;
+}
+
+// Resolve a deal by id OR token (unchanged)
+function findDealByParam(param) {
+  const n = Number(param);
+  if (!Number.isNaN(n)) return deals.find(d => d.id === n) || null;
+  return deals.find(d => d.key === param) || null;
+}
+
+// --- Extraction & matching helpers ---
+
+// crude VIN finder: 17 chars, A-HJ-NPR-Z and 0-9 (I, O, Q excluded)
+const VIN_RE = /\b([A-HJ-NPR-Z0-9]{17})\b/i;
+
+// pull simple candidates from subject/body
+function extractCandidates({ subject, text, html }) {
+  const hay = `${subject || ""}\n${text || ""}\n${html || ""}`;
+  const vin = (hay.match(VIN_RE) || [])[1];
+  // basic URL sniff
+  const urlMatch = hay.match(/https?:\/\/[^\s)>\]]+/i);
+  const url = urlMatch ? urlMatch[0] : null;
+  return { vin, url };
+}
+
+// try to match an inbound email to a deal
+function matchDealForEmail({ recipient, sender, subject, text, html }) {
+  // 1) by recipient token (deals-<key>@)
+  const m = (recipient || "").toLowerCase().match(/^deals-([a-z0-9]+)@/);
+  if (m) {
+    const byToken = deals.find(d => d.key === m[1]);
+    if (byToken) return byToken;
+  }
+
+  // 2) by VIN in content
+  const { vin, url } = extractCandidates({ subject, text, html });
+  if (vin) {
+    const byVin = deals.find(d => (d.vin || "").toUpperCase() === vin.toUpperCase());
+    if (byVin) return byVin;
+  }
+
+  // 3) by dealer email domain
+  const senderDomain = (sender || "").split("@")[1]?.toLowerCase();
+  if (senderDomain) {
+    const byDomain = deals.find(d => (d.dealerEmailDomain || "").toLowerCase() === senderDomain);
+    if (byDomain) return byDomain;
+  }
+
+  // 4) by URL mention (contains the deal url)
+  if (url) {
+    const byUrl = deals.find(d => (d.url && url.toLowerCase().includes(d.url.toLowerCase())));
+    if (byUrl) return byUrl;
+  }
+
+  // 5) give up → unmatched (null)
+  return null;
 }
 
 // ===== Mailgun send helper (outbound email) =====
@@ -111,6 +175,27 @@ app.get("/deals/:param/messages", (req, res) => {
   const items = messages.filter(m => m.dealId === deal.id);
   res.json(items);
 });
+// List unmatched inbound emails (dealId == null)
+app.get("/inbox/unmatched", (req, res) => {
+  const items = messages.filter(m => m.dealId === null).sort((a,b) => a.id - b.id);
+  res.json(items);
+});
+
+// Attach an unmatched message to a deal (by id or key)
+app.post("/inbox/attach", (req, res) => {
+  const { messageId, dealParam } = req.body || {};
+  if (!messageId || !dealParam) {
+    return res.status(400).json({ error: "messageId and dealParam are required" });
+  }
+  const msg = messages.find(m => m.id === Number(messageId));
+  if (!msg) return res.status(404).json({ error: "Message not found" });
+  const deal = findDealByParam(dealParam);
+  if (!deal) return res.status(404).json({ error: "Deal not found" });
+
+  msg.dealId = deal.id;
+  res.json({ ok: true, message: msg });
+});
+
 
 // Create outbound message (send email via Mailgun; Reply-To = deal proxy)
 app.post("/deals/:param/messages", async (req, res) => {
@@ -163,7 +248,6 @@ app.post("/deals/:param/messages", async (req, res) => {
 app.post("/webhooks/email/mailgun", async (req, res) => {
   try {
     const f = req.body || {};
-
     const recipient = f.recipient || f.to || f["To"] || "";
     const sender    = f.sender || f.from || f["From"] || "";
     const subject   = f.subject || f["Subject"] || "";
@@ -171,39 +255,30 @@ app.post("/webhooks/email/mailgun", async (req, res) => {
     const html      = f["body-html"]  || f["stripped-html"]  || "";
     const messageId = f["message-id"] || f["Message-Id"] || f["Message-ID"] || "";
 
-    // Extract token from recipient: deals-p8j5o5u@hagglehub.app -> token = p8j5o5u
-    let token = "";
-    const m = recipient.toLowerCase().match(/^deals-([a-z0-9]+)@/);
-    if (m) token = m[1];
-
-    // Find deal by token; fallback to first deal so nothing gets lost (MVP)
-    let deal = token ? deals.find(d => d.key === token) : null;
-    if (!deal) deal = deals[0];
+    const matchedDeal = matchDealForEmail({ recipient, sender, subject, text, html });
 
     messages.push({
       id: messages.length + 1,
-      dealId: deal.id,
+      dealId: matchedDeal ? matchedDeal.id : null, // <— null = unmatched inbox
       channel: "email",
       direction: "in",
       body: text || html || "(no body)",
-      meta: { sender, subject, messageId, recipient, token },
+      meta: { sender, subject, messageId, recipient },
       createdAt: new Date().toISOString()
     });
 
     console.log("Inbound email (Mailgun):", {
-      token,
-      dealKey: deal.key,
-      dealId: deal.id,
+      matched: !!matchedDeal,
+      dealId: matchedDeal?.id || null,
+      by: matchedDeal ? "heuristic" : "unmatched",
       sender,
       subject,
       preview: (text || html || "").slice(0, 120)
     });
 
-    // Return 200 quickly so Mailgun doesn't retry
     return res.status(200).send("OK");
   } catch (e) {
     console.error("Inbound email error:", e && e.message ? e.message : String(e));
-    // Still 200 while debugging to avoid Mailgun retries
     return res.status(200).send("OK");
   }
 });
