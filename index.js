@@ -1,9 +1,9 @@
-// HaggleHub API (starter) — Express + Mailgun inbound
+// HaggleHub API (starter) — Express + Mailgun inbound/outbound
 // Endpoints:
 //   GET  /health
 //   GET  /deals
 //   GET  /deals/:id/messages
-//   POST /deals/:id/messages          (stub for outbound email; logs only)
+//   POST /deals/:id/messages          (sends email via Mailgun)
 //   POST /webhooks/email/mailgun      (inbound email from Mailgun; returns 200 fast)
 //
 // Deploy on Render as a Web Service:
@@ -12,14 +12,28 @@
 //
 // Env Vars (Render → Environment):
 //   CORS_ORIGIN=https://app.hagglehub.app   (or * while testing)
-//   MAILGUN_DOMAIN=hagglehub.app
+//   MAILGUN_DOMAIN=hagglehub.app            (or mg.hagglehub.app)
 //   MAILGUN_API_KEY=key-xxxxxxxxxxxxxxxxxxxxxxxxxxxx
-//   MAIL_FROM=noreply@hagglehub.app         (used later for outbound)
+//   MAIL_FROM=HaggleHub <noreply@hagglehub.app>
 
 import express from "express";
 import cors from "cors";
 
-// --- Mailgun send helper (outbound email) ---
+const app = express();
+
+// ===== Middleware =====
+app.use(cors({ origin: process.env.CORS_ORIGIN || "*"}));
+app.use(express.json());
+// Mailgun will POST form-encoded fields by default
+app.use(express.urlencoded({ extended: false }));
+
+// ===== In-memory data (MVP) =====
+const deals = [
+  { id: 1, dealerName: "Test Dealer", vehicleTitle: "Sample Car", url: "", status: "open", best_offer_otd: null }
+];
+const messages = []; // { id, dealId, channel, direction, body, meta, createdAt }
+
+// ===== Mailgun send helper (outbound email) =====
 async function sendEmailViaMailgun({ to, subject, text, html }) {
   const apiKey = process.env.MAILGUN_API_KEY;
   const domain = process.env.MAILGUN_DOMAIN;
@@ -32,7 +46,6 @@ async function sendEmailViaMailgun({ to, subject, text, html }) {
   const url = `https://api.mailgun.net/v3/${domain}/messages`;
   const auth = "Basic " + Buffer.from(`api:${apiKey}`).toString("base64");
 
-  // Mailgun expects form-encoded body
   const form = new URLSearchParams();
   form.set("from", from);
   form.set("to", to);
@@ -54,20 +67,6 @@ async function sendEmailViaMailgun({ to, subject, text, html }) {
   return res.json();
 }
 
-const app = express();
-
-// ===== Middleware =====
-app.use(cors({ origin: process.env.CORS_ORIGIN || "*"}));
-app.use(express.json());
-// Mailgun will POST form-encoded fields by default
-app.use(express.urlencoded({ extended: false }));
-
-// ===== In-memory data (MVP) =====
-const deals = [
-  { id: 1, dealerName: "Test Dealer", vehicleTitle: "Sample Car", url: "", status: "open", best_offer_otd: null }
-];
-const messages = []; // { id, dealId, channel, direction, body, meta, createdAt }
-
 // ===== Routes =====
 
 // Healthcheck
@@ -79,10 +78,10 @@ app.get("/deals", (req, res) => res.json(deals));
 // List messages for a deal
 app.get("/deals/:id/messages", (req, res) => {
   const dealId = Number(req.params.id);
-  res.json(messages.filter(m => m.dealId === dealId));
+  res.json(messages.filter((m) => m.dealId === dealId));
 });
 
-// Create outbound message (now sends email via Mailgun)
+// Create outbound message (sends email via Mailgun)
 app.post("/deals/:id/messages", async (req, res) => {
   try {
     const dealId = Number(req.params.id);
@@ -128,26 +127,23 @@ app.post("/deals/:id/messages", async (req, res) => {
   }
 });
 
-  messages.push(msg);
-
-  // TODO: implement outbound email via Mailgun API (kept as stub for now)
-  console.log("Outbound message (stub):", { to, subject, preview: (body || "").slice(0, 120) });
-
-  res.json(msg);
-});
-
 // Inbound Mailgun webhook (dealer -> HaggleHub via email)
 app.post("/webhooks/email/mailgun", async (req, res) => {
   try {
     const f = req.body || {};
-    const sender  = f.sender || f.from || f["From"] || "";
-    const subject = f.subject || f["Subject"] || "";
-    const text    = f["body-plain"] || f["stripped-text"] || "";
-    const html    = f["body-html"]  || f["stripped-html"]  || "";
+    const sender    = f.sender || f.from || f["From"] || "";
+    const subject   = f.subject || f["Subject"] || "";
+    const text      = f["body-plain"] || f["stripped-text"] || "";
+    const html      = f["body-html"]  || f["stripped-html"]  || "";
     const messageId = f["message-id"] || f["Message-Id"] || f["Message-ID"] || "";
 
-    // Very basic deal association: always attach to deal #1 for MVP
-    const dealId = 1;
+    // Basic auto-linking: look for [Deal#ID] in subject, else default to 1
+    let dealId = 1;
+    const match = subject && subject.match(/\[Deal#(\d+)\]/i);
+    if (match) {
+      const maybe = Number(match[1]);
+      if (!Number.isNaN(maybe)) dealId = maybe;
+    }
 
     messages.push({
       id: messages.length + 1,
@@ -160,7 +156,10 @@ app.post("/webhooks/email/mailgun", async (req, res) => {
     });
 
     console.log("Inbound email (Mailgun):", {
-      sender, subject, preview: (text || html || "").slice(0, 120)
+      sender,
+      subject,
+      preview: (text || html || "").slice(0, 120),
+      dealId
     });
 
     // Always ack 200 quickly so Mailgun doesn't retry
