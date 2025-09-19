@@ -61,12 +61,6 @@ function findDealByParam(param) {
   return deals.find(d => d.key === param) || null;
 }
 
-// Build proxy email (unchanged)
-function dealProxyEmail(deal) {
-  const domain = process.env.MAILGUN_DOMAIN || "hagglehub.app";
-  return `deals-${deal.key}@${domain}`;
-}
-
 // Resolve a deal by id OR token (unchanged)
 function findDealByParam(param) {
   const n = Number(param);
