@@ -1,16 +1,15 @@
-// HaggleHub API — Express + Mailgun (token-based routing)
+// HaggleHub API — Express + Mailgun (token-based routing + unmatched inbox)
+//
 // Endpoints:
 //   GET  /health
 //   GET  /deals                      (includes proxyEmail for each deal)
 //   GET  /deals/:param/messages      (:param = numeric id OR deal key/token)
 //   POST /deals/:param/messages      (send email; Reply-To = deal proxy email)
-//   POST /webhooks/email/mailgun     (inbound email; attaches by recipient token)
+//   POST /webhooks/email/mailgun     (inbound email; auto-match to deal or inbox)
+//   GET  /inbox/unmatched            (list messages with dealId == null)
+//   POST /inbox/attach               (attach unmatched message to a deal)
 //
-// Render deploy:
-//   Build: npm install
-//   Start: npm start
-//
-// Required ENV (Render → Service → Environment):
+// Required ENV (Render → Environment):
 //   CORS_ORIGIN=https://app.hagglehub.app   (or * while testing)
 //   MAILGUN_DOMAIN=hagglehub.app            (or mg.hagglehub.app)
 //   MAILGUN_API_KEY=key-xxxxxxxxxxxxxxxxxxx
@@ -24,11 +23,9 @@ const app = express();
 // ===== Middleware =====
 app.use(cors({ origin: process.env.CORS_ORIGIN || "*" }));
 app.use(express.json());
-// Mailgun posts form-encoded by default
-app.use(express.urlencoded({ extended: false }));
+app.use(express.urlencoded({ extended: false })); // Mailgun posts form-encoded
 
 // ===== In-memory data (MVP) =====
-// Add VIN / dealerEmailDomain if you have them, helps auto-match
 const deals = [
   {
     id: 1,
@@ -36,7 +33,7 @@ const deals = [
     dealerName: "Test Dealer",
     dealerEmailDomain: "dealer.com",   // optional
     vehicleTitle: "Sample Car",
-    vin: "1ABCDEFG2HIJKL345",           // optional (17 chars)
+    vin: "1ABCDEFG2HIJKL345",           // optional
     url: "https://dealer.com/inventory/sample-car",
     status: "open",
     best_offer_otd: null,
@@ -45,47 +42,34 @@ const deals = [
 
 const messages = []; // { id, dealId|null, channel, direction, body, meta, createdAt }
 
+// ===== Helpers =====
 
-// Helper: build the proxy email for a deal
+// Build proxy email for a deal
 function dealProxyEmail(deal) {
   const domain = process.env.MAILGUN_DOMAIN || "hagglehub.app";
   return `deals-${deal.key}@${domain}`;
 }
 
-// Helper: resolve a deal by id OR token
-function findDealByParam(param) {
-  const n = Number(param);
-  if (!Number.isNaN(n)) {
-    return deals.find(d => d.id === n) || null;
-  }
-  return deals.find(d => d.key === param) || null;
-}
-
-// Resolve a deal by id OR token (unchanged)
+// Resolve a deal by numeric id OR token
 function findDealByParam(param) {
   const n = Number(param);
   if (!Number.isNaN(n)) return deals.find(d => d.id === n) || null;
   return deals.find(d => d.key === param) || null;
 }
 
-// --- Extraction & matching helpers ---
-
-// crude VIN finder: 17 chars, A-HJ-NPR-Z and 0-9 (I, O, Q excluded)
+// crude VIN finder: 17 chars, excludes I,O,Q
 const VIN_RE = /\b([A-HJ-NPR-Z0-9]{17})\b/i;
 
-// pull simple candidates from subject/body
 function extractCandidates({ subject, text, html }) {
   const hay = `${subject || ""}\n${text || ""}\n${html || ""}`;
   const vin = (hay.match(VIN_RE) || [])[1];
-  // basic URL sniff
   const urlMatch = hay.match(/https?:\/\/[^\s)>\]]+/i);
   const url = urlMatch ? urlMatch[0] : null;
   return { vin, url };
 }
 
-// try to match an inbound email to a deal
 function matchDealForEmail({ recipient, sender, subject, text, html }) {
-  // 1) by recipient token (deals-<key>@)
+  // 1) by recipient token
   const m = (recipient || "").toLowerCase().match(/^deals-([a-z0-9]+)@/);
   if (m) {
     const byToken = deals.find(d => d.key === m[1]);
@@ -106,14 +90,13 @@ function matchDealForEmail({ recipient, sender, subject, text, html }) {
     if (byDomain) return byDomain;
   }
 
-  // 4) by URL mention (contains the deal url)
+  // 4) by URL mention
   if (url) {
     const byUrl = deals.find(d => (d.url && url.toLowerCase().includes(d.url.toLowerCase())));
     if (byUrl) return byUrl;
   }
 
-  // 5) give up → unmatched (null)
-  return null;
+  return null; // unmatched
 }
 
 // ===== Mailgun send helper (outbound email) =====
@@ -135,7 +118,7 @@ async function sendEmailViaMailgun({ to, subject, text, html, replyTo }) {
   form.set("subject", subject || "");
   if (html) form.set("html", html);
   form.set("text", text || "");
-  if (replyTo) form.set("h:Reply-To", replyTo); // ensures replies flow to the token address
+  if (replyTo) form.set("h:Reply-To", replyTo);
 
   const res = await fetch(url, {
     method: "POST",
@@ -156,52 +139,30 @@ async function sendEmailViaMailgun({ to, subject, text, html, replyTo }) {
 // Healthcheck
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// List deals (include each deal's proxyEmail for convenience)
+// List deals
 app.get("/deals", (req, res) => {
   const result = deals.map(d => ({ ...d, proxyEmail: dealProxyEmail(d) }));
   res.json(result);
 });
 
-// List messages for a deal (by id or key)
+// List messages for a deal (id or key)
 app.get("/deals/:param/messages", (req, res) => {
   const deal = findDealByParam(req.params.param);
   if (!deal) return res.status(404).json({ error: "Deal not found" });
   const items = messages.filter(m => m.dealId === deal.id);
   res.json(items);
 });
-// List unmatched inbound emails (dealId == null)
-app.get("/inbox/unmatched", (req, res) => {
-  const items = messages.filter(m => m.dealId === null).sort((a,b) => a.id - b.id);
-  res.json(items);
-});
 
-// Attach an unmatched message to a deal (by id or key)
-app.post("/inbox/attach", (req, res) => {
-  const { messageId, dealParam } = req.body || {};
-  if (!messageId || !dealParam) {
-    return res.status(400).json({ error: "messageId and dealParam are required" });
-  }
-  const msg = messages.find(m => m.id === Number(messageId));
-  if (!msg) return res.status(404).json({ error: "Message not found" });
-  const deal = findDealByParam(dealParam);
-  if (!deal) return res.status(404).json({ error: "Deal not found" });
-
-  msg.dealId = deal.id;
-  res.json({ ok: true, message: msg });
-});
-
-
-// Create outbound message (send email via Mailgun; Reply-To = deal proxy)
+// Create outbound message (send via Mailgun)
 app.post("/deals/:param/messages", async (req, res) => {
   try {
     const deal = findDealByParam(req.params.param);
     if (!deal) return res.status(404).json({ error: "Deal not found" });
 
     const { channel = "email", to, subject = "", body = "", html } = req.body || {};
-    if (channel !== "email") return res.status(400).json({ error: "Only email is supported in this endpoint" });
+    if (channel !== "email") return res.status(400).json({ error: "Only email is supported" });
     if (!to) return res.status(400).json({ error: "Missing 'to' (dealer email)" });
 
-    // Optional subject tagging (not required when using tokenized Reply-To)
     const finalSubject = subject || "HaggleHub message";
 
     await sendEmailViaMailgun({
@@ -237,8 +198,7 @@ app.post("/deals/:param/messages", async (req, res) => {
   }
 });
 
-// Inbound Mailgun webhook (dealer -> HaggleHub via email)
-// Associates by recipient token: deals-<token>@<domain>
+// Inbound Mailgun webhook
 app.post("/webhooks/email/mailgun", async (req, res) => {
   try {
     const f = req.body || {};
@@ -253,7 +213,7 @@ app.post("/webhooks/email/mailgun", async (req, res) => {
 
     messages.push({
       id: messages.length + 1,
-      dealId: matchedDeal ? matchedDeal.id : null, // <— null = unmatched inbox
+      dealId: matchedDeal ? matchedDeal.id : null,
       channel: "email",
       direction: "in",
       body: text || html || "(no body)",
@@ -264,7 +224,6 @@ app.post("/webhooks/email/mailgun", async (req, res) => {
     console.log("Inbound email (Mailgun):", {
       matched: !!matchedDeal,
       dealId: matchedDeal?.id || null,
-      by: matchedDeal ? "heuristic" : "unmatched",
       sender,
       subject,
       preview: (text || html || "").slice(0, 120)
@@ -277,9 +236,29 @@ app.post("/webhooks/email/mailgun", async (req, res) => {
   }
 });
 
+// Inbox endpoints
+app.get("/inbox/unmatched", (req, res) => {
+  const items = messages.filter(m => m.dealId === null).sort((a, b) => a.id - b.id);
+  res.json(items);
+});
+
+app.post("/inbox/attach", (req, res) => {
+  const { messageId, dealParam } = req.body || {};
+  if (!messageId || !dealParam) {
+    return res.status(400).json({ error: "messageId and dealParam are required" });
+  }
+  const msg = messages.find(m => m.id === Number(messageId));
+  if (!msg) return res.status(404).json({ error: "Message not found" });
+  const deal = findDealByParam(dealParam);
+  if (!deal) return res.status(404).json({ error: "Deal not found" });
+
+  msg.dealId = deal.id;
+  res.json({ ok: true, message: msg });
+});
+
 // Root hint
 app.get("/", (req, res) => {
-  res.send("HaggleHub API is running. Try GET /deals, GET /deals/p8j5o5u/messages, or POST /webhooks/email/mailgun");
+  res.send("HaggleHub API running. Try GET /deals, GET /deals/p8j5o5u/messages, GET /inbox/unmatched");
 });
 
 // ===== Start =====
