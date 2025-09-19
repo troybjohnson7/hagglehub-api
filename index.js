@@ -19,6 +19,41 @@
 import express from "express";
 import cors from "cors";
 
+// --- Mailgun send helper (outbound email) ---
+async function sendEmailViaMailgun({ to, subject, text, html }) {
+  const apiKey = process.env.MAILGUN_API_KEY;
+  const domain = process.env.MAILGUN_DOMAIN;
+  const from   = process.env.MAIL_FROM;
+
+  if (!apiKey || !domain || !from) {
+    throw new Error("Missing MAILGUN_API_KEY, MAILGUN_DOMAIN, or MAIL_FROM");
+  }
+
+  const url = `https://api.mailgun.net/v3/${domain}/messages`;
+  const auth = "Basic " + Buffer.from(`api:${apiKey}`).toString("base64");
+
+  // Mailgun expects form-encoded body
+  const form = new URLSearchParams();
+  form.set("from", from);
+  form.set("to", to);
+  form.set("subject", subject || "");
+  if (html) form.set("html", html);
+  form.set("text", text || "");
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { Authorization: auth, "Content-Type": "application/x-www-form-urlencoded" },
+    body: form.toString()
+  });
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`Mailgun send failed: ${res.status} ${res.statusText} ${body}`);
+  }
+
+  return res.json();
+}
+
 const app = express();
 
 // ===== Middleware =====
@@ -47,21 +82,52 @@ app.get("/deals/:id/messages", (req, res) => {
   res.json(messages.filter(m => m.dealId === dealId));
 });
 
-// Create outbound message (stub)
+// Create outbound message (now sends email via Mailgun)
 app.post("/deals/:id/messages", async (req, res) => {
-  const dealId = Number(req.params.id);
-  const { channel = "email", to, subject = "", body = "" } = req.body || {};
+  try {
+    const dealId = Number(req.params.id);
+    const { channel = "email", to, subject = "", body = "", html } = req.body || {};
 
-  // Save to timeline (outbound)
-  const msg = {
-    id: messages.length + 1,
-    dealId,
-    channel,
-    direction: "out",
-    body: String(body || ""),
-    meta: { to, subject },
-    createdAt: new Date().toISOString()
-  };
+    if (channel !== "email") {
+      return res.status(400).json({ error: "Only email is supported in this patch" });
+    }
+    if (!to) {
+      return res.status(400).json({ error: "Missing 'to' (dealer email)" });
+    }
+
+    // Ensure we tag the subject with the Deal id so replies auto-attach later
+    const taggedSubject = subject.includes("[Deal#")
+      ? subject
+      : `[Deal#${dealId}] ${subject || "HaggleHub message"}`;
+
+    // 1) Send via Mailgun
+    await sendEmailViaMailgun({
+      to,
+      subject: taggedSubject,
+      text: body,
+      html
+    });
+
+    // 2) Save to timeline (outbound)
+    const msg = {
+      id: messages.length + 1,
+      dealId,
+      channel: "email",
+      direction: "out",
+      body: String(body || ""),
+      meta: { to, subject: taggedSubject },
+      createdAt: new Date().toISOString()
+    };
+    messages.push(msg);
+
+    console.log("Outbound email sent:", { to, subject: taggedSubject, preview: (body || "").slice(0, 120) });
+    res.json(msg);
+  } catch (err) {
+    console.error("Outbound email error:", err.message || String(err));
+    res.status(502).json({ error: "Failed to send email", details: err.message || String(err) });
+  }
+});
+
   messages.push(msg);
 
   // TODO: implement outbound email via Mailgun API (kept as stub for now)
