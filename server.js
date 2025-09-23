@@ -1,25 +1,25 @@
 import express from "express";
 import cors from "cors";
-import bodyParser from "body-parser";
-
-// If you're on Node 18+, fetch is global; otherwise: import fetch from "node-fetch";
+import "dotenv/config";
 
 const app = express();
-app.use(bodyParser.json());
+app.use(express.json());
 
-// Strict CORS allow-list: read from env
+// CORS allow-list from env (comma-separated)
 const allowed = (process.env.CORS_ORIGIN || "").split(",").map(s => s.trim()).filter(Boolean);
 app.use(cors({
   origin(origin, cb) {
-    if (!origin) return cb(null, true);          // same-origin / server-to-server
+    // allow same-origin or server-to-server (no Origin header)
+    if (!origin) return cb(null, true);
     if (allowed.includes(origin)) return cb(null, true);
-    cb(new Error(`CORS blocked: ${origin}`));
+    return cb(new Error(`CORS blocked: ${origin}`));
   }
 }));
 
+app.get("/", (_req, res) => res.type("text").send("HaggleHub API is running."));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-app.post("/send-email", async (req, res) => {
+async function handleSendEmail(req, res) {
   try {
     const { to, subject, text, html, replyTo } = req.body || {};
     if (!to || !subject || (!text && !html)) {
@@ -29,7 +29,6 @@ app.post("/send-email", async (req, res) => {
     const apiKey = process.env.MAILGUN_API_KEY;
     const domain = process.env.MAILGUN_DOMAIN;
     const from = process.env.MAILGUN_FROM;
-
     if (!apiKey || !domain || !from) {
       return res.status(500).json({ ok: false, error: "Mailgun not configured on server." });
     }
@@ -55,13 +54,15 @@ app.post("/send-email", async (req, res) => {
     if (!mgRes.ok) {
       return res.status(mgRes.status).json({ ok: false, error: `Mail provider error: ${mgText}` });
     }
-
     return res.json({ ok: true, id: `mailgun:${Date.now()}` });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ ok: false, error: "Server error while sending email." });
   }
-});
+}
+
+app.post("/send-email", handleSendEmail);
+app.post("/api/send-email", handleSendEmail);
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`API listening on :${port}`));

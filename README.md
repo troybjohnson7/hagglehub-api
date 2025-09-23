@@ -1,38 +1,34 @@
-# HaggleHub API (Starter on Render)
+# HaggleHub Minimal Backend (Express + Mailgun)
 
-Minimal Express API to receive **Mailgun inbound emails**, store messages in memory, and serve your frontend.
-
-## Endpoints
+Exposes:
 - `GET /health` → `{ ok: true }`
-- `GET /deals` → demo list of deals
-- `GET /deals/:id/messages` → messages for a deal
-- `POST /deals/:id/messages` → stub for outbound email (logs only)
-- `POST /webhooks/email/mailgun` → **Mailgun inbound webhook** (returns 200 immediately)
+- `GET /` → “HaggleHub API is running.”
+- `POST /send-email` → Sends email via Mailgun
+- (also accepts `POST /api/send-email`)
 
-## Deploy on Render
-1. Push this repo to GitHub (`hagglehub-api`).
-2. In Render → **New → Web Service** → pick the repo.
-3. **Build Command:** `npm install`
-4. **Start Command:** `npm start`
-5. **Environment Variables** (Render → Service → Environment):
-   - `CORS_ORIGIN` = `https://app.hagglehub.app` (or `*` while testing)
-   - `MAILGUN_DOMAIN` = `hagglehub.app` (used later for outbound)
-   - `MAILGUN_API_KEY` = `key-...` (used later for outbound)
-   - `MAIL_FROM` = `noreply@hagglehub.app` (used later for outbound)
-
-## Mailgun Route
-In Mailgun → **Receiving → Routes**:
-
-```txt
-match_recipient(".*@hagglehub.app")
-forward("https://api.hagglehub.app/webhooks/email/mailgun")
-stop()
+## Quick start (local)
+```bash
+npm i
+copy .env.example .env   # set your values
+npm start
+# test
+curl -i http://localhost:3000/health
+curl -i -X POST http://localhost:3000/send-email -H "Content-Type: application/json" -d "{"to":"you@yourmail.com","subject":"Test","text":"Hello"}"
 ```
 
-Hit **Test**. You should see 200 OK, and the message will appear at:
-`GET https://api.hagglehub.app/deals/1/messages`
+## Required env vars (Render backend only; NEVER in frontend)
+- `CORS_ORIGIN` → comma-separated list of allowed frontends (e.g., `https://hagglehub.app,https://hagglehub-web.onrender.com`)
+- `MAILGUN_API_KEY` → your Mailgun API key
+- `MAILGUN_DOMAIN` → `mg.yourdomain.com`
+- `MAILGUN_FROM` → `HaggleHub <no-reply@yourdomain.com>`
+- `PORT` → optional (defaults to 3000)
 
-## Next steps
-- Replace in-memory arrays with Postgres + Prisma.
-- Implement outbound email via Mailgun API in `POST /deals/:id/messages`.
-- Add subject token `[Deal#ID]` to outbound to auto-link replies.
+## Render deploy
+1) Create Web Service (Node 18).
+2) Build: `npm i` | Start: `npm start`.
+3) Add env vars above.
+4) Point custom domain `https://api.hagglehub.app` to this service.
+
+## Frontend config
+- `VITE_API_URL=https://api.hagglehub.app`
+- The FE will call `POST ${VITE_API_URL}/send-email`
