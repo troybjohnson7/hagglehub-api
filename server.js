@@ -21,6 +21,16 @@ const genId = () => "msg_" + Date.now() + "_" + Math.random().toString(36).slice
 app.get("/", (_req, res) => res.type("text").send("HaggleHub API is running."));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
+// Debug endpoint to verify Mailgun env
+app.get("/debug/mailgun", (_req, res) => {
+  const apiBase = process.env.MAILGUN_API_BASE || "https://api.mailgun.net";
+  const apiKeySet = !!process.env.MAILGUN_API_KEY;
+  const domain = process.env.MAILGUN_DOMAIN || "";
+  const from = process.env.MAILGUN_FROM || "";
+  const configured = apiKeySet && !!domain && !!from;
+  res.json({ ok: true, configured, apiBase, apiKeySet, domain, from });
+});
+
 async function sendEmailHandler(req, res) {
   try {
     const { to, subject, text, html, replyTo } = req.body || {};
@@ -28,6 +38,7 @@ async function sendEmailHandler(req, res) {
       return res.status(400).json({ ok: false, error: "Missing: 'to', 'subject', and one of 'text' or 'html'." });
     }
     const apiKey = process.env.MAILGUN_API_KEY;
+    const apiBase = process.env.MAILGUN_API_BASE || "https://api.mailgun.net";
     const domain = process.env.MAILGUN_DOMAIN;
     const from = process.env.MAILGUN_FROM;
     if (!apiKey || !domain || !from) {
@@ -40,7 +51,8 @@ async function sendEmailHandler(req, res) {
     if (text) form.append("text", text);
     if (html) form.append("html", html);
     if (replyTo) form.append("h:Reply-To", replyTo);
-    const mgRes = await fetch(`https://api.mailgun.net/v3/${domain}/messages`, {
+
+    const mgRes = await fetch(`${apiBase}/v3/${domain}/messages`, {
       method: "POST",
       headers: {
         "Authorization": "Basic " + Buffer.from(`api:${apiKey}`).toString("base64"),
@@ -77,11 +89,9 @@ app.post("/webhooks/email/mailgun", async (req, res) => {
     const subject = payload["subject"] || "";
     const text = payload["body-plain"] || payload["text"] || "";
     const html = payload["body-html"] || payload["html"] || "";
-
     let userKey = "";
     const m = /deals-([^@]+)@/i.exec(to);
     if (m) userKey = m[1];
-
     const msg = { id: genId(), userKey, from, to, subject, text, html, ts: Date.now() };
     store.inbox.unshift(msg);
     return res.json({ ok: true, id: msg.id });
