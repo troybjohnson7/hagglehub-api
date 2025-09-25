@@ -12,16 +12,18 @@ app.use(cors({
     if (!origin) return cb(null, true);
     if (!allowed.length || allowed.includes(origin)) return cb(null, true);
     return cb(new Error(`CORS blocked: ${origin}`));
-  }
+  },
+  credentials: true
 }));
 
 const store = { inbox: [] };
 const genId = () => "msg_" + Date.now() + "_" + Math.random().toString(36).slice(2,8);
 
+// Health & root
 app.get("/", (_req, res) => res.type("text").send("HaggleHub API is running."));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-// Debug endpoint to verify Mailgun env
+// Debug: Mailgun envs
 app.get("/debug/mailgun", (_req, res) => {
   const apiBase = process.env.MAILGUN_API_BASE || "https://api.mailgun.net";
   const apiKeySet = !!process.env.MAILGUN_API_KEY;
@@ -31,6 +33,27 @@ app.get("/debug/mailgun", (_req, res) => {
   res.json({ ok: true, configured, apiBase, apiKeySet, domain, from });
 });
 
+// --- Minimal auth for the UI gating ---
+// If DEV_FORCE_USER=true, always return a dev user so the app can proceed past About/Onboarding.
+app.get("/users/me", (_req, res) => {
+  if (process.env.DEV_FORCE_USER === "true") {
+    return res.json({
+      id: "local-admin",
+      key: "local-admin",
+      full_name: "Haggle Admin",
+      email: "admin@hagglehub.app",
+      user_metadata: { avatar_url: null }
+    });
+  }
+  // If not forced, return unauthenticated
+  return res.status(401).json({ error: "unauthenticated" });
+});
+
+app.post("/auth/logout", (_req, res) => {
+  res.status(204).end();
+});
+
+// --- Outbound email ---
 async function sendEmailHandler(req, res) {
   try {
     const { to, subject, text, html, replyTo } = req.body || {};
@@ -73,6 +96,7 @@ async function sendEmailHandler(req, res) {
 app.post("/send-email", sendEmailHandler);
 app.post("/api/send-email", sendEmailHandler);
 
+// --- Inbound webhook (Mailgun) ---
 app.use("/webhooks/email/mailgun", createRawBodyMiddleware());
 app.post("/webhooks/email/mailgun", async (req, res) => {
   try {
@@ -89,9 +113,11 @@ app.post("/webhooks/email/mailgun", async (req, res) => {
     const subject = payload["subject"] || "";
     const text = payload["body-plain"] || payload["text"] || "";
     const html = payload["body-html"] || payload["html"] || "";
+
     let userKey = "";
     const m = /deals-([^@]+)@/i.exec(to);
     if (m) userKey = m[1];
+
     const msg = { id: genId(), userKey, from, to, subject, text, html, ts: Date.now() };
     store.inbox.unshift(msg);
     return res.json({ ok: true, id: msg.id });
@@ -101,6 +127,7 @@ app.post("/webhooks/email/mailgun", async (req, res) => {
   }
 });
 
+// Inbox reads
 app.get("/inbox/unmatched", (req, res) => {
   const userKey = String(req.query.userKey || "");
   const items = store.inbox.filter(m => m.userKey === userKey);
